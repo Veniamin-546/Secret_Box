@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secret Box - Анонимные вопросы</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Telegram Web App Script -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, collection, addDoc, onSnapshot, query, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'secret-box-app';
+
+        // Состояние приложения
+        let currentUser = null;
+        let targetUser = null; 
+        let messages = [];
+
+        // UI Элементы
+        const splash = document.getElementById('splash');
+        const regScreen = document.getElementById('registration-screen');
+        const mainScreen = document.getElementById('app');
+        const sendScreen = document.getElementById('send-question-screen');
+        const toast = document.getElementById('copy-toast');
+
+        // Инициализация
+        async function init() {
+            // Telegram WebApp инициализация
+            if (window.Telegram && window.Telegram.WebApp) {
+                window.Telegram.WebApp.ready();
+                window.Telegram.WebApp.expand();
+            }
+
+            // Пытаемся достать ID из параметров (обычный URL или Telegram startapp)
+            const urlParams = new URLSearchParams(window.location.search);
+            let targetId = urlParams.get('user');
+            
+            // В Telegram WebApps параметры передаются в tgWebAppStartParam
+            if (!targetId && window.Telegram?.WebApp?.initDataUnsafe?.start_param) {
+                targetId = window.Telegram.WebApp.initDataUnsafe.start_param;
+            }
+
+            // Авторизация
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    currentUser = user;
+                    
+                    // Если мы зашли по чужой ссылке
+                    if (targetId && targetId !== user.uid) {
+                        try {
+                            const targetDoc = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'users', targetId));
+                            if (targetDoc.exists()) {
+                                targetUser = { id: targetId, ...targetDoc.data() };
+                                showScreen('send');
+                                return;
+                            }
+                        } catch (e) { console.error("Ошибка загрузки получателя", e); }
+                    }
+                    
+                    // Если своей ссылки нет или это обычный вход
+                    checkUserRegistration();
+                }
+            });
+        }
+
+        async function checkUserRegistration() {
+            const userDoc = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'users', currentUser.uid));
+            if (userDoc.exists()) {
+                currentUser.nickname = userDoc.data().nickname;
+                currentUser.hasLink = userDoc.data().hasLink || false;
+                showScreen('main');
+                loadMessages();
+            } else {
+                showScreen('reg');
+            }
+        }
+
+        function showScreen(type) {
+            splash.style.opacity = '0';
+            setTimeout(() => splash.style.display = 'none', 500);
+            
+            regScreen.classList.add('hidden');
+            mainScreen.classList.add('hidden');
+            sendScreen.classList.add('hidden');
+
+            if (type === 'reg') regScreen.classList.remove('hidden');
+            if (type === 'main') {
+                mainScreen.classList.remove('hidden');
+                document.getElementById('display-nickname').innerText = currentUser.nickname;
+                updateLinkUI();
+            }
+            if (type === 'send') {
+                sendScreen.classList.remove('hidden');
+                document.getElementById('target-nickname').innerText = targetUser.nickname;
+            }
+            lucide.createIcons();
+        }
+
+        // РЕГИСТРАЦИЯ
+        window.registerUser = async () => {
+            const nick = document.getElementById('input-nickname').value.trim();
+            if (!nick) return;
+            
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'users', currentUser.uid), {
+                nickname: nick,
+                hasLink: false,
+                createdAt: Date.now()
+            });
+            currentUser.nickname = nick;
+            showScreen('main');
+        };
+
+        // ГЕНЕРАЦИЯ ССЫЛКИ
+        window.generateLink = async () => {
+            await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'users', currentUser.uid), {
+                hasLink: true
+            }, { merge: true });
+            currentUser.hasLink = true;
+            updateLinkUI();
+        };
+
+        function updateLinkUI() {
+            const linkBox = document.getElementById('link-box');
+            const genBtn = document.getElementById('generate-btn');
+            if (currentUser.hasLink) {
+                linkBox.classList.remove('hidden');
+                genBtn.classList.add('hidden');
+                
+                // Формат ссылки для Telegram Бота
+                // Замени 'YOUR_BOT_USERNAME' на имя своего бота без @
+                const botUsername = "secret_box_bot"; 
+                const linkText = `https://t.me/${botUsername}/app?startapp=${currentUser.uid}`;
+                document.getElementById('link-url').innerText = linkText;
+            } else {
+                linkBox.classList.add('hidden');
+                genBtn.classList.remove('hidden');
+            }
+        }
+
+        // ОТПРАВКА ВОПРОСА
+        window.sendQuestion = async () => {
+            const text = document.getElementById('question-text').value.trim();
+            if (!text) return;
+
+            const btn = document.getElementById('send-btn');
+            btn.disabled = true;
+            btn.innerText = "Отправка...";
+
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'messages'), {
+                toId: targetUser.id,
+                text: text,
+                isNew: true,
+                createdAt: Date.now()
+            });
+
+            document.getElementById('question-input-area').innerHTML = `
+                <div class="text-center py-10 animate-bounce">
+                    <div class="w-20 h-20 bg-green-500/20 rounded-full flex items-center justify-center mx-auto mb-6">
+                         <i data-lucide="check" class="w-10 h-10 text-green-500"></i>
+                    </div>
+                    <h3 class="font-unbounded text-xl font-black">ОТПРАВЛЕНО!</h3>
+                    <p class="text-white/40 mt-2 px-6">Вопрос улетел анонимно. Теперь твоя очередь?</p>
+                    <button onclick="window.location.search = ''" class="mt-8 bg-white text-black px-8 py-4 rounded-3xl font-black">СОЗДАТЬ СВОЙ БОКС</button>
+                </div>
+            `;
+            lucide.createIcons();
+        };
+
+        // ЗАГРУЗКА СООБЩЕНИЙ
+        function loadMessages() {
+            const q = collection(db, 'artifacts', appId, 'public', 'data', 'messages');
+            onSnapshot(q, (snapshot) => {
+                const allMsgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                messages = allMsgs.filter(m => m.toId === currentUser.uid)
+                                  .sort((a, b) => b.createdAt - a.createdAt);
+                renderMessages();
+            }, (err) => console.error(err));
+        }
+
+        function renderMessages() {
+            const list = document.getElementById('messages-list');
+            const countLabel = document.getElementById('msg-count');
+            const newCount = messages.filter(m => m.isNew).length;
+            countLabel.innerText = newCount;
+
+            if (messages.length === 0) {
+                list.innerHTML = `
+                    <div class="text-center py-20 opacity-20">
+                        <i data-lucide="inbox" class="w-12 h-12 mx-auto mb-4"></i>
+                        <p class="font-bold">Пока нет вопросов</p>
+                    </div>
+                `;
+            } else {
+                list.innerHTML = messages.map(msg => `
+                    <div onclick="openMessage('${msg.id}')" class="message-card p-5 rounded-[28px] border border-white/5 relative overflow-hidden ${msg.isNew ? 'is-new glow' : 'bg-white/5 opacity-80'}">
+                        <div class="flex justify-between items-start mb-3">
+                            <i data-lucide="${msg.isNew ? 'mail' : 'mail-open'}" class="w-4 h-4 ${msg.isNew ? 'text-indigo-400' : 'text-white/20'}"></i>
+                            <span class="text-[10px] text-white/30 font-bold">${new Date(msg.createdAt).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</span>
+                        </div>
+                        <p class="text-sm font-medium ${msg.isNew ? 'blur-sm select-none' : ''}">${msg.text}</p>
+                    </div>
+                `).join('');
+            }
+            lucide.createIcons();
+        }
+
+        window.openMessage = async (id) => {
+            const msg = messages.find(m => m.id === id);
+            if (msg && msg.isNew) {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'messages', id), { isNew: false }, { merge: true });
+            }
+        };
+
+        window.copyLink = () => {
+            const text = document.getElementById('link-url').innerText;
+            const el = document.createElement('textarea');
+            el.value = text;
+            document.body.appendChild(el);
+            el.select();
+            document.execCommand('copy');
+            document.body.removeChild(el);
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), 2000);
+            
+            // Если мы в Telegram, можно использовать их метод
+            if (window.Telegram?.WebApp) {
+                window.Telegram.WebApp.HapticFeedback.notificationOccurred('success');
+            }
+        };
+
+        init();
+    </script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;700;900&family=Inter:wght@400;600;800&display=swap');
+        :root { --bg-color: #080a16; --accent-color: #6366f1; }
+        body { font-family: 'Inter', sans-serif; background-color: var(--bg-color); color: white; margin: 0; -webkit-tap-highlight-color: transparent; }
+        .font-unbounded { font-family: 'Unbounded', sans-serif; }
+        .is-new { background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%); border: 1px solid rgba(99, 102, 241, 0.3); }
+        .glow { box-shadow: 0 0 20px rgba(99, 102, 241, 0.2); }
+        .loader { width: 40px; height: 40px; border: 4px solid rgba(255, 255, 255, 0.1); border-left-color: var(--accent-color); border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #copy-toast { transform: translateX(-50%) translateY(100px); transition: transform 0.3s ease; left: 50%; }
+        #copy-toast.show { transform: translateX(-50%) translateY(0); }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+
+    <!-- ЗАГРУЗКА -->
+    <div id="splash" class="fixed inset-0 z-[100] bg-[#080a16] flex flex-col items-center justify-center p-8 transition-opacity duration-500">
+        <div class="w-20 h-20 bg-indigo-600 rounded-[28px] flex items-center justify-center glow mb-6 animate-pulse">
+            <i data-lucide="lock" class="w-10 h-10 text-white"></i>
+        </div>
+        <h1 class="font-unbounded text-2xl font-black mb-10">SECRET BOX</h1>
+        <div class="loader"></div>
+    </div>
+
+    <!-- РЕГИСТРАЦИЯ -->
+    <div id="registration-screen" class="hidden min-h-screen flex flex-col items-center justify-center p-8 text-center">
+        <div class="w-24 h-24 bg-white/5 rounded-full flex items-center justify-center mb-8 border border-white/10">
+            <i data-lucide="user-plus" class="w-10 h-10 text-indigo-400"></i>
+        </div>
+        <h2 class="font-unbounded text-xl font-black mb-2 uppercase">Твой никнейм</h2>
+        <p class="text-white/40 text-sm mb-8 leading-relaxed">Придумай имя, которое увидят друзья перед отправкой вопроса</p>
+        <input type="text" id="input-nickname" placeholder="Напр: Вениамин" class="w-full bg-white/5 border border-white/10 p-5 rounded-3xl outline-none focus:border-indigo-500 transition-all font-bold text-center mb-6">
+        <button onclick="registerUser()" class="w-full bg-indigo-600 p-5 rounded-3xl font-black shadow-lg shadow-indigo-500/20 active:scale-95 transition-transform uppercase">Продолжить</button>
+    </div>
+
+    <!-- ОКНО ОТПРАВКИ (ДЛЯ ДРУЗЕЙ) -->
+    <div id="send-question-screen" class="hidden min-h-screen flex flex-col p-6">
+        <header class="py-10 text-center">
+            <div class="w-20 h-20 bg-gradient-to-tr from-indigo-600 to-purple-600 rounded-[30px] mx-auto mb-6 flex items-center justify-center shadow-2xl border border-white/10">
+                <i data-lucide="message-circle" class="w-10 h-10 text-white"></i>
+            </div>
+            <h2 class="font-unbounded text-lg font-black uppercase">Спроси <span id="target-nickname" class="text-indigo-400">...</span></h2>
+            <p class="text-white/40 text-[10px] mt-2 uppercase tracking-widest font-bold">Полностью анонимно</p>
+        </header>
+
+        <div id="question-input-area" class="flex-1 flex flex-col">
+            <textarea id="question-text" placeholder="Твой анонимный вопрос..." class="w-full flex-1 bg-white/5 border border-white/10 p-6 rounded-[40px] outline-none focus:border-indigo-500 transition-all font-medium text-lg resize-none mb-6 shadow-inner"></textarea>
+            <button id="send-btn" onclick="sendQuestion()" class="w-full bg-white text-black p-6 rounded-[30px] font-black text-lg active:scale-95 transition-transform mb-10 shadow-xl uppercase">Отправить</button>
+        </div>
+    </div>
+
+    <!-- ГЛАВНЫЙ ЭКРАН (ЛИЧНЫЙ КАБИНЕТ) -->
+    <div id="app" class="hidden max-w-md mx-auto min-h-screen flex flex-col">
+        <header class="p-6 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded-2xl bg-indigo-600 flex items-center justify-center font-bold">
+                    <i data-lucide="user" class="w-5 h-5"></i>
+                </div>
+                <h2 id="display-nickname" class="font-black text-sm uppercase tracking-tight">...</h2>
+            </div>
+            <div class="bg-indigo-500/10 text-indigo-400 text-[9px] font-black px-3 py-1.5 rounded-full border border-indigo-500/20 uppercase tracking-widest">Профиль</div>
+        </header>
+
+        <section class="px-6 mb-8">
+            <button id="generate-btn" onclick="generateLink()" class="w-full bg-white text-black p-6 rounded-[32px] font-black flex items-center justify-center gap-3 active:scale-95 transition-transform shadow-xl">
+                <i data-lucide="zap" class="w-5 h-5 fill-black"></i>
+                ГЕНЕРИРОВАТЬ ССЫЛКУ
+            </button>
+
+            <div id="link-box" class="hidden bg-indigo-600/10 border border-indigo-500/20 rounded-[32px] p-6 relative overflow-hidden shadow-lg">
+                <h3 class="font-unbounded text-[10px] font-bold text-indigo-400 uppercase mb-3 tracking-widest">Твоя ссылка для сторис</h3>
+                <div class="flex items-center gap-2 bg-black/40 p-2 pl-4 rounded-2xl border border-white/5">
+                    <span id="link-url" class="text-[10px] font-mono text-white/40 truncate flex-1 italic">...</span>
+                    <button onclick="copyLink()" class="bg-indigo-600 px-4 py-2 rounded-xl text-[10px] font-black active:scale-90 transition-transform">КОПИРОВАТЬ</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="px-6 flex-1">
+            <div class="flex items-center justify-between mb-6 px-1">
+                <h3 class="font-unbounded text-xs font-black uppercase italic">Входящие (<span id="msg-count">0</span>)</h3>
+                <span class="text-[9px] font-bold text-white/20 uppercase tracking-widest">Обновление live</span>
+            </div>
+            <div id="messages-list" class="space-y-4 pb-12">
+                <!-- Сообщения -->
+            </div>
+        </section>
+
+        <div id="copy-toast" class="fixed bottom-10 bg-white text-black px-6 py-3 rounded-2xl font-bold text-sm shadow-2xl z-50 flex items-center gap-2">
+            <i data-lucide="check" class="w-4 h-4"></i> Ссылка скопирована!
+        </div>
+    </div>
+
+</body>
+</html>
